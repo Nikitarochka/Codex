@@ -7,6 +7,7 @@ import ctypes as ct
 import os
 import math
 import platform
+import struct
 
 # ===== единицы, 1-в-1 как в pe5_direct.py =====
 
@@ -17,20 +18,96 @@ def m3d_to_bbl_d(x):   return x * 6.28981
 def bar_to_psi(b):     return b * 14.503773773
 def psi_per_ft_to_pa_per_m(x): return x * 6894.8 / 0.3048
 
+STUB_MODE = os.environ.get("OLGAS_STUB") == "1"
+
+
 # ===== загрузка DLL OLGAS =====
 
-# !!! ПОДПРАВЬ путь !!!
-DLL_PATH = r"C:\Users\user\Documents\nikitat\OLGA-S\libolgas2000.dll"
+def _resolve_dll_path():
+    """Возвращает путь к DLL и проверяет, что он существует."""
+    dll_path = os.environ.get(
+        "OLGAS_DLL_PATH",
+        os.path.join(os.path.dirname(__file__), "libolgas2000.dll"),
+    )
 
-if hasattr(os, "add_dll_directory"):
-    os.add_dll_directory(os.path.dirname(DLL_PATH))
-try:
-    ct.windll.kernel32.SetDefaultDllDirectories(0x00001000)
-except Exception:
-    pass
+    if not os.path.exists(dll_path):
+        raise FileNotFoundError(
+            f"Не найден libolgas2000.dll по пути {dll_path}. "
+            "Положи DLL рядом со скриптом или укажи OLGAS_DLL_PATH"
+        )
+    return dll_path
+
+
+def _detect_pe_bits(dll_path):
+    """Определяет разрядность PE-файла по полю OptionalHeader.Magic (0x10b/0x20b)."""
+
+    with open(dll_path, "rb") as f:
+        data = f.read(0x200)
+
+    if data[:2] != b"MZ":
+        return None
+
+    pe_off = struct.unpack_from("<I", data, 0x3C)[0]
+    if pe_off + 0x18 + 2 > len(data):
+        return None
+
+    magic = struct.unpack_from("<H", data, pe_off + 0x18)[0]
+    if magic == 0x20B:
+        return 64
+    if magic == 0x10B:
+        return 32
+    return None
+
+
+def _ensure_platform_matches(dll_path):
+    """Сообщает реальную разрядность DLL и проверяет, что среда ей соответствует.
+
+    Если выставить переменную окружения ``OLGAS_FORCE_LOAD=1``, проверка пропускается —
+    это может понадобиться на хостах без нужной платформы, чтобы хотя бы выполнить
+    отладочную компиляцию. При этом загрузка 32-битной DLL в 64-битном интерпретаторе
+    всё равно, скорее всего, завершится ошибкой.
+    """
+
+    if os.environ.get("OLGAS_FORCE_LOAD") == "1":
+        return
+
+    dll_bits = _detect_pe_bits(dll_path)
+    py_bits = struct.calcsize("P") * 8
+
+    if os.name != "nt":
+        raise OSError(
+            f"libolgas2000.dll — {dll_bits or '?'}-битный PE, нужен Windows; "
+            f"текущая платформа: {platform.system()} (Python {py_bits}-бит). "
+            "Запусти скрипт под Windows с Python той же разрядности, что и DLL"
+        )
+
+    if dll_bits and dll_bits != py_bits:
+        raise OSError(
+            f"libolgas2000.dll — {dll_bits}-битная, Python сейчас {py_bits}-бит; "
+            "нужно совпадение разрядностей. Установи Python соответствующей битности"
+        )
+
+
+def _load_olgas_dll():
+    if STUB_MODE:
+        return None
+
+    dll_path = _resolve_dll_path()
+    _ensure_platform_matches(dll_path)
+
+    if hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(os.path.dirname(dll_path))
+    try:
+        ct.windll.kernel32.SetDefaultDllDirectories(0x00001000)
+    except Exception:
+        # Для старых версий Windows это нормально
+        pass
+
+    return ct.CDLL(dll_path)
+
 
 LOAD_WITH_ALTERED_SEARCH_PATH = 0x00000008
-olgas_dll = ct.CDLL(DLL_PATH)
+olgas_dll = _load_olgas_dll()
 
 # ===== типы и прототип =====
 
@@ -39,40 +116,41 @@ DoublePtr = ct.POINTER(ct.c_double)
 IntPtr    = ct.POINTER(ct.c_int)
 UIntPtr   = ct.POINTER(ct.c_uint)
 
-OLGAS2000_SSH = olgas_dll.OLGAS2000_SSH
-OLGAS2000_SSH.restype = None
+if not STUB_MODE:
+    OLGAS2000_SSH = olgas_dll.OLGAS2000_SSH
+    OLGAS2000_SSH.restype = None
 
-OLGAS2000_SSH.argtypes = (
-    ct.POINTER(OLGAS_MSG),  # param_1 (msg[16])
+    OLGAS2000_SSH.argtypes = (
+        ct.POINTER(OLGAS_MSG),  # param_1 (msg[16])
 
-    # param_2..param_6: double*
-    DoublePtr, DoublePtr, DoublePtr, DoublePtr, DoublePtr,
+        # param_2..param_6: double*
+        DoublePtr, DoublePtr, DoublePtr, DoublePtr, DoublePtr,
 
-    # param_7: undefined8 / opaque (8 байт!)
-    ct.c_double,
+        # param_7: undefined8 / opaque (8 байт!)
+        ct.c_double,
 
 
-    # param_8..param_14: double*
-    DoublePtr, DoublePtr, DoublePtr, DoublePtr, DoublePtr, DoublePtr, DoublePtr,
+        # param_8..param_14: double*
+        DoublePtr, DoublePtr, DoublePtr, DoublePtr, DoublePtr, DoublePtr, DoublePtr,
 
-    # param_15..param_20: int*/uint*/int*/...
-    IntPtr, UIntPtr, IntPtr, IntPtr, IntPtr, IntPtr,
+        # param_15..param_20: int*/uint*/int*/...
+        IntPtr, UIntPtr, IntPtr, IntPtr, IntPtr, IntPtr,
 
-    # param_21..param_42: 22 x double*
-    *([DoublePtr] * 22),
+        # param_21..param_42: 22 x double*
+        *([DoublePtr] * 22),
 
-    # param_43..param_44: int*
-    IntPtr, IntPtr,
+        # param_43..param_44: int*
+        IntPtr, IntPtr,
 
-    # param_45: double*
-    DoublePtr,
+        # param_45: double*
+        DoublePtr,
 
-    # param_46: int* (код)
-    IntPtr,
+        # param_46: int* (код)
+        IntPtr,
 
-    # param_47..param_48: double*
-    DoublePtr, DoublePtr,
-)
+        # param_47..param_48: double*
+        DoublePtr, DoublePtr,
+    )
 
 # ===== выделение аргументов =====
 
@@ -208,7 +286,45 @@ def _alloc_olgas_all():
 
     return args, scalars
 
-def _call_olgas(args):
+def _stub_olgas(args, scalars):
+    """Простейшая заглушка, позволяющая получить осмысленный вывод без DLL.
+
+    Это не настоящая корреляция OLGAS. Значения подобраны, чтобы быть сравнимыми
+    по порядку величины с примером PE5, и масштабируются от расхода.
+    """
+
+    # Извлекаем то, что положили перед вызовом
+    q_liq = scalars["p11"].value
+    q_gas = scalars["p12"].value
+    angle = scalars["p4"].value
+
+    total_flow = max(q_liq + q_gas, 1e-9)
+    holdup = q_liq / total_flow
+
+    # базовый градиент в psi/ft, слегка масштабируем по расходу и углу
+    base_grad = 0.02 * (total_flow / 500.0)
+    grav_factor = abs(math.sin(angle))
+
+    total_psi_ft = base_grad * (0.4 + 0.6 * grav_factor)
+    fric_psi_ft = total_psi_ft * 0.2
+
+    scalars["p23"].value = holdup
+    scalars["p36"].value = total_psi_ft
+    scalars["p37"].value = fric_psi_ft
+
+    # arr47 – просто нули для совместимости
+    for i in range(len(scalars["arr47"])):
+        scalars["arr47"][i] = 0.0
+
+    # код завершения — 6 как в примере PE5
+    scalars["p46"].value = 6
+
+
+def _call_olgas(args, scalars):
+    if STUB_MODE:
+        _stub_olgas(args, scalars)
+        return
+
     OLGAS2000_SSH(
         args["param_1"],
         args["param_2"], args["param_3"], args["param_4"], args["param_5"], args["param_6"],
@@ -298,7 +414,7 @@ def run_olgas(
     S["p19"].value = int(accel_on)
     S["p20"].value = int(flag2_value)
 
-    _call_olgas(args)
+    _call_olgas(args, S)
 
     code = S["p46"].value  # это *param_48 в FUN_18005c2b0
 
